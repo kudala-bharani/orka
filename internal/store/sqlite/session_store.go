@@ -26,6 +26,9 @@ func (s *Store) CreateSession(ctx context.Context, session *store.SessionRecord)
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
+	if err := ensureNativeSessionNameAvailableTx(ctx, tx, session.Namespace, session.Name); err != nil {
+		return err
+	}
 	// Non-Gateway transcript-only completions permit deliberate name reuse.
 	// Kubernetes identities and Gateway continuation chains remain reserved.
 	if _, err := tx.ExecContext(ctx,
@@ -49,7 +52,7 @@ func (s *Store) CreateSession(ctx context.Context, session *store.SessionRecord)
 		 )`,
 		session.Namespace, session.Name, session.SessionType, session.ActiveTask, session.ActiveTaskUID,
 		session.MessageCount, session.InputTokens, session.OutputTokens, session.Cancelled,
-		session.CreatedAt, session.UpdatedAt,
+		utcTime(session.CreatedAt), utcTime(session.UpdatedAt),
 		session.Namespace, session.Name, session.Namespace, session.Name,
 	)
 	if err != nil {
@@ -129,19 +132,25 @@ func (s *Store) ListSessions(ctx context.Context, namespace string) ([]store.Ses
 	return sessions, rows.Err()
 }
 
-// ListSessionsPage pushes the name cursor, type filter, ordering, and LIMIT
+// ListSessionsPage pushes the cursor, type filter, ordering, and LIMIT
 // into SQL so a continuation request reads only its own page.
-func (s *Store) ListSessionsPage(ctx context.Context, namespace, afterName string, limit int, excludeType string) ([]store.SessionMetadata, bool, error) {
+func (s *Store) ListSessionsPage(ctx context.Context, namespace string, after *store.SessionPageCursor, limit int, excludeType string) ([]store.SessionMetadata, bool, error) {
 	if limit <= 0 {
 		return nil, false, nil
+	}
+	// Session timestamps are written in UTC, so their text sorts in time order.
+	hasCursor, afterCreatedAt, afterName := after != nil, time.Time{}, ""
+	if hasCursor {
+		afterCreatedAt, afterName = utcTime(after.CreatedAt), after.Name
 	}
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT name, session_type, message_count, input_tokens, output_tokens, created_at, updated_at, active_task, active_task_uid
 		 FROM sessions
-		 WHERE namespace = ? AND name > ? AND (? = '' OR session_type <> ?)
-		 ORDER BY name ASC
+		 WHERE namespace = ? AND (? = '' OR session_type <> ?)
+		   AND (NOT ? OR created_at < ? OR (created_at = ? AND name > ?))
+		 ORDER BY created_at DESC, name ASC
 		 LIMIT ?`,
-		namespace, afterName, excludeType, excludeType, limit+1,
+		namespace, excludeType, excludeType, hasCursor, afterCreatedAt, afterCreatedAt, afterName, limit+1,
 	)
 	if err != nil {
 		return nil, false, err
@@ -170,6 +179,8 @@ func (s *Store) ListSessionsPage(ctx context.Context, namespace, afterName strin
 // its messages (via CASCADE), and its session-scoped execution event read
 // model. Open turns, active mutation leases, reconciliation-blocked controls,
 // and undelivered projections keep the session durable for recovery.
+//
+//nolint:gocyclo // Session deletion keeps active-work gates and dependent-row cleanup in one transaction.
 func (s *Store) DeleteSession(ctx context.Context, namespace, name string) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -272,6 +283,9 @@ func (s *Store) DeleteSession(ctx context.Context, namespace, name string) error
 	if err := advanceTaskDataCleanupGeneration(ctx, tx, namespace); err != nil {
 		return err
 	}
+	if err := deleteNativeSessionTx(ctx, tx, namespace, name); err != nil {
+		return err
+	}
 	deleteResult, err := tx.ExecContext(ctx,
 		`DELETE FROM sessions WHERE namespace = ? AND name = ? AND session_type <> ?`,
 		namespace, name, store.SessionTypeGateway,
@@ -371,7 +385,22 @@ func (s *Store) AcquireLockUntil(ctx context.Context, namespace, name, ownerName
 	return s.acquireLock(ctx, namespace, name, ownerName, ownerUID, &expiresAt)
 }
 
+// Legacy locks and transcript writes cannot update native checkpoint boundaries.
+func rejectLegacyNativeSession(ctx context.Context, q controlQueryRower, namespace, name string) error {
+	var count int
+	if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM native_session_snapshots WHERE namespace=? AND session_name=?`, namespace, name).Scan(&count); err != nil {
+		return err
+	}
+	if count != 0 {
+		return store.ValidationErrorf("native Session requires a Codex runtime with native continuity; legacy locks and transcript writes are unsupported")
+	}
+	return nil
+}
+
 func (s *Store) acquireLock(ctx context.Context, namespace, name, taskName, taskUID string, expiresAt *time.Time) error {
+	if err := rejectLegacyNativeSession(ctx, s.db, namespace, name); err != nil {
+		return err
+	}
 	// Check if session exists
 	var count int
 	err := s.db.QueryRowContext(ctx,
@@ -437,8 +466,8 @@ func (s *Store) acquireLock(ctx context.Context, namespace, name, taskName, task
 		   AND NOT EXISTS (
 		     SELECT 1 FROM session_cleanup_intents
 		     WHERE namespace = ? AND session_name = ?
-		   )`,
-		taskName, taskUID, expiresValue, namespace, name, now, taskName, taskUID, now, namespace, name,
+		   ) AND NOT EXISTS (SELECT 1 FROM native_session_snapshots WHERE namespace=? AND session_name=?)`,
+		taskName, taskUID, expiresValue, namespace, name, now, taskName, taskUID, now, namespace, name, namespace, name,
 	)
 	if err != nil {
 		return err
@@ -449,6 +478,9 @@ func (s *Store) acquireLock(ctx context.Context, namespace, name, taskName, task
 		return err
 	}
 	if rows == 0 {
+		if err := rejectLegacyNativeSession(ctx, s.db, namespace, name); err != nil {
+			return err
+		}
 		if pending, pendingErr := s.HasSessionCleanupIntent(ctx, namespace, name); pendingErr != nil {
 			return pendingErr
 		} else if pending {
@@ -489,6 +521,19 @@ func (s *Store) AcquireChatTurn(
 		return false, err
 	}
 	defer tx.Rollback() //nolint:errcheck
+	if err := ensureNativeSessionNameAvailableTx(ctx, tx, session.Namespace, session.Name); err != nil {
+		return false, err
+	}
+	var nativeSnapshot bool
+	if err := tx.QueryRowContext(ctx,
+		`SELECT EXISTS(SELECT 1 FROM native_session_snapshots WHERE namespace = ? AND session_name = ?)`,
+		session.Namespace, session.Name,
+	).Scan(&nativeSnapshot); err != nil {
+		return false, err
+	}
+	if nativeSnapshot {
+		return false, store.ConflictErrorf("native Session must continue through an agent Task")
+	}
 
 	if err := ensureNoSessionCleanupIntentTx(ctx, tx, session.Namespace, session.Name); err != nil {
 		return false, err
@@ -806,6 +851,10 @@ func (s *Store) appendMessages(
 		return err
 	}
 	defer tx.Rollback() //nolint:errcheck
+
+	if err := rejectLegacyNativeSession(ctx, tx, namespace, name); err != nil {
+		return err
+	}
 
 	var ownerType string
 	if err := tx.QueryRowContext(ctx, `SELECT owner_type FROM sessions WHERE namespace = ? AND name = ?`,
@@ -1158,6 +1207,34 @@ func (s *Store) UpdateTokenCountsWithLock(
 		return fmt.Errorf("%w: session %s/%s lock owner changed or expired", store.ErrConflict, namespace, name)
 	}
 	return nil
+}
+
+// ReleaseLockWithTokenUsage releases the owner's lock and, while that lock is
+// still current and the session is not being cleaned up, adds the owner's
+// token usage in the same statement. A replay after the lock was released
+// matches no row and counts nothing.
+func (s *Store) ReleaseLockWithTokenUsage(
+	ctx context.Context,
+	namespace, name, ownerName, ownerUID string,
+	inputTokens, outputTokens int,
+) error {
+	now := time.Now().UTC()
+	// SET expressions see the row as it was before this UPDATE, so the lock
+	// expiry test reads the lock being released.
+	counted := `(active_task_expires_at IS NULL OR active_task_expires_at > ?)
+		AND NOT EXISTS (SELECT 1 FROM session_cleanup_intents WHERE namespace = ? AND session_name = ?)`
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE sessions
+		 SET input_tokens = input_tokens + CASE WHEN `+counted+` THEN ? ELSE 0 END,
+		     output_tokens = output_tokens + CASE WHEN `+counted+` THEN ? ELSE 0 END,
+		     updated_at = ?,
+		     active_task = '', active_task_uid = '', active_task_expires_at = NULL
+		 WHERE namespace = ? AND name = ? AND active_task = ? AND active_task_uid = ?`,
+		now, namespace, name, inputTokens,
+		now, namespace, name, outputTokens,
+		now, namespace, name, ownerName, ownerUID,
+	)
+	return err
 }
 
 // nilIfEmpty returns nil if s is empty, otherwise returns a pointer to s.

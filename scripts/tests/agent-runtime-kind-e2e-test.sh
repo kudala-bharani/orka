@@ -34,7 +34,7 @@ grep -F 'orka/acp-opencode-runtime' "${bootstrap}" >/dev/null
 grep -F 'orka/general-worker' "${bootstrap}" >/dev/null
 grep -F 'ACP_OPENCODE_RUNTIME_IMG="${LIVE_ACP_OPENCODE_REF}"' "${bootstrap}" >/dev/null
 grep -F 'GENERAL_WORKER_IMG="${LIVE_ACP_GENERAL_WORKER_REF}"' "${bootstrap}" >/dev/null
-grep -F 'opencode_model="${ACP_E2E_OPENCODE_MODEL:-${ACP_E2E_CODEX_MODEL:-gpt-5.4}}"' "${bootstrap}" >/dev/null
+grep -F 'opencode_model="${ACP_E2E_OPENCODE_MODEL:-${ACP_E2E_CODEX_MODEL:-gpt-5.4-mini}}"' "${bootstrap}" >/dev/null
 grep -F 'opencode_model="${opencode_model#*/}"' "${bootstrap}" >/dev/null
 grep -F 'ACP_E2E_OPENCODE_CONTEXT_WINDOW must be a positive integer' "${bootstrap}" >/dev/null
 grep -F 'ACP_E2E_OPENCODE_MAX_TOKENS must be a positive integer' "${bootstrap}" >/dev/null
@@ -399,6 +399,35 @@ if PATH="${fake_bin}:${PATH}" COPILOT_GITHUB_TOKEN='' "${wrapper}" --preflight-o
   exit 1
 fi
 grep -F 'noninteractive and never starts device-code login' "${fake_bin}/missing.out" >/dev/null
+
+(
+  unset ACP_E2E_WRITE_CREATE_PR ACP_E2E_WRITE_PUBLICATION_REPO
+  output="$(PATH="${fake_bin}:${PATH}" COPILOT_GITHUB_TOKEN='' ACP_E2E_MODEL_BACKEND=aimock RELEASE_GATE=1 \
+    ACP_E2E_REPO=https://github.com/orka-agents/orka.git \
+    ACP_E2E_REF=0123456789abcdef0123456789abcdef01234567 \
+    "${wrapper}" --preflight-only 2>&1)"
+  grep -F 'preflight passed' <<<"${output}" >/dev/null
+  if PATH="${fake_bin}:${PATH}" ACP_E2E_MODEL_BACKEND=aimock RELEASE_GATE=1 \
+      ACP_E2E_REPO=https://github.com/orka-agents/orka.git \
+      ACP_E2E_REF=0123456789abcdef0123456789abcdef01234567 \
+      ACP_E2E_AIMOCK_IMAGE='ghcr.io/copilotkit/aimock:1.43.0' \
+      "${wrapper}" --preflight-only >"${fake_bin}/aimock-unpinned.out" 2>&1; then
+    echo 'preflight unexpectedly accepted an unpinned aimock image' >&2
+    exit 1
+  fi
+  grep -F 'ACP_E2E_AIMOCK_IMAGE must be digest-pinned' "${fake_bin}/aimock-unpinned.out" >/dev/null
+)
+if PATH="${fake_bin}:${PATH}" ACP_E2E_MODEL_BACKEND=aimock "${wrapper}" --preflight-only >"${fake_bin}/aimock-smoke.out" 2>&1; then
+  echo 'preflight unexpectedly accepted aimock outside the release gate' >&2
+  exit 1
+fi
+grep -F 'scripts only RELEASE_GATE=1' "${fake_bin}/aimock-smoke.out" >/dev/null
+if PATH="${fake_bin}:${PATH}" ACP_E2E_MODEL_BACKEND=other "${wrapper}" --preflight-only >"${fake_bin}/backend.out" 2>&1; then
+  echo 'preflight unexpectedly accepted an unknown model backend' >&2
+  exit 1
+fi
+grep -F 'ACP_E2E_MODEL_BACKEND must be vekil or aimock' "${fake_bin}/backend.out" >/dev/null
+printf '%s\n' 'ok - aimock preflight needs no model credential, runs only for the release gate, and rejects unpinned images and unknown backends'
 
 (
   unset ACP_E2E_WRITE_CREATE_PR ACP_E2E_WRITE_PUBLICATION_REPO

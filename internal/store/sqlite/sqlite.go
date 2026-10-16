@@ -7,8 +7,10 @@ import (
 	"io"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	harnessv2 "github.com/orka-agents/orka/internal/harness/v2"
 	"github.com/prometheus/client_golang/prometheus"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/metrics"
@@ -30,8 +32,13 @@ func init() {
 }
 
 // NewDB opens a SQLite database with recommended pragmas for WAL mode,
-// busy timeout, synchronous mode, and foreign keys.
+// busy timeout, synchronous mode, and foreign keys. It creates or validates the
+// current schema; upgrades require OpenLockedStore's exclusive controller lock.
 func NewDB(path string) (*sql.DB, error) {
+	return newDB(path, false)
+}
+
+func newDB(path string, allowMigration bool) (*sql.DB, error) {
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
 		return nil, err
@@ -50,6 +57,10 @@ func NewDB(path string) (*sql.DB, error) {
 		"PRAGMA busy_timeout=5000",
 		"PRAGMA synchronous=NORMAL",
 		"PRAGMA foreign_keys=ON",
+		// Deleted content is overwritten with zeros rather than left in free
+		// pages: connector custody rows are crypto-shredded on disconnect,
+		// and a later file snapshot must not be able to recover them.
+		"PRAGMA secure_delete=ON",
 	}
 	for _, p := range pragmas {
 		if _, err := db.Exec(p); err != nil {
@@ -58,9 +69,13 @@ func NewDB(path string) (*sql.DB, error) {
 		}
 	}
 
-	if err := initializeSchema(db); err != nil {
+	schemaErr := initializeSchema(db)
+	if schemaErr != nil && allowMigration {
+		schemaErr = upgradeSchema(db, path, schemaErr)
+	}
+	if schemaErr != nil {
 		db.Close() //nolint:errcheck
-		return nil, fmt.Errorf("failed to initialize SQLite schema: %w", err)
+		return nil, fmt.Errorf("failed to initialize SQLite schema: %w", schemaErr)
 	}
 
 	return db, nil
@@ -791,6 +806,8 @@ func currentSchemaStatements() []string {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_github_mutation_records_monitor
 			ON github_mutation_records(monitor_namespace, monitor_name, target_kind, target_number, operation, created_at DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_github_mutation_records_operation_sha
+			ON github_mutation_records(operation, target_sha, created_at DESC, id DESC)`,
 		`CREATE TABLE IF NOT EXISTS repair_jobs (
 			id                  TEXT PRIMARY KEY,
 			monitor_namespace   TEXT NOT NULL,
@@ -956,7 +973,10 @@ func currentSchemaStatements() []string {
 
 	statements = append(statements, controlSchemaStatements()...)
 	statements = append(statements, gatewayTaskCleanupSchemaStatements()...)
-	return append(statements, agentExecutionSchemaStatements()...)
+	statements = append(statements, usageSchema()...)
+	statements = append(statements, agentExecutionSchemaStatements()...)
+	statements = append(statements, nativeSessionSchemaStatements()...)
+	return append(statements, connectorSchemaStatements()...)
 }
 
 // Store implements both store.ResultStore and store.SessionStore.
@@ -966,10 +986,18 @@ type Store struct {
 	dbPath           string
 	processLock      io.Closer
 	executionEventMu sync.Mutex
+	// pendingWALTruncate remembers a connector custody deletion whose log
+	// truncation found the log busy; the next custody operation finishes it.
+	// It starts set, so a truncation a previous process could not finish is
+	// completed by this process's first custody operation.
+	pendingWALTruncate atomic.Bool
 
 	// snapshotCipher encrypts immutable agent execution snapshot bodies at
 	// rest. Snapshot persistence fails closed while it is nil.
 	snapshotCipher *AgentExecutionSnapshotCipher
+
+	// nativeSessionMaxBytes limits new bundles, not authenticated stored reads.
+	nativeSessionMaxBytes int
 
 	// applyMemoryProposalAfterAcceptedRead is a test hook used to coordinate
 	// multi-connection proposal-apply races after an accepted proposal is read.
@@ -983,7 +1011,9 @@ type Store struct {
 // NewStore creates a new Store backed by the given SQLite database.
 // The dbPath is the filesystem path to the database file (used for metrics and logging).
 func NewStore(db *sql.DB, dbPath string) *Store {
-	return &Store{db: db, dbPath: dbPath}
+	s := &Store{db: db, dbPath: dbPath, nativeSessionMaxBytes: harnessv2.DefaultMaxNativeSessionBytes}
+	s.pendingWALTruncate.Store(true)
+	return s
 }
 
 // OpenLockedStore acquires the process-lifetime filesystem lock adjacent to
@@ -995,12 +1025,14 @@ func OpenLockedStore(path string) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	db, err := NewDB(path)
+	db, err := newDB(path, true)
 	if err != nil {
 		_ = lock.Close()
 		return nil, err
 	}
-	return &Store{db: db, dbPath: path, processLock: lock}, nil
+	store := &Store{db: db, dbPath: path, processLock: lock, nativeSessionMaxBytes: harnessv2.DefaultMaxNativeSessionBytes}
+	store.pendingWALTruncate.Store(true)
+	return store, nil
 }
 
 // Start runs background maintenance and blocks until ctx is cancelled,

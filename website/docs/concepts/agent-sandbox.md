@@ -5,17 +5,28 @@ description: "Running an agent's workspace in a kubernetes-sigs Agent Sandbox, b
 
 # Agent Sandbox workspaces
 
-Upstream `agent-sandbox` is an externally installed and operated
-execution-workspace provider. Orka can host a built-in agent Task's ACP
-RuntimeSession inside a provider-owned sandbox through a
-**workspace-provider-backed RuntimePool**. The integration is disabled by
-default and fails closed.
+[kubernetes-sigs/agent-sandbox](https://github.com/kubernetes-sigs/agent-sandbox) is an
+externally installed and operated execution-workspace provider. Orka can host a built-in
+agent Task's RuntimeSession inside a provider-owned sandbox through a
+**workspace-provider-backed RuntimePool**. The integration is disabled by default and fails
+closed. [Execution workspaces](execution-workspaces.md) compares it with Agent Substrate and
+shows how to turn it on.
 
-Orka requires agent-sandbox `v1.0.0`; older releases are unsupported. Operators
-upgrading an existing v0.5 installation must complete the upstream
-[storage migration](https://github.com/kubernetes-sigs/agent-sandbox/blob/v0.5.6/docs/api-migration-guide.md)
-before installing v1.0.0. Orka does not install, upgrade, or migrate the
-provider in production.
+:::tip[Video demo]
+Watch [Suspend an agent workspace and keep its files](https://www.youtube.com/watch?v=DyS9JioSRa0).
+:::
+
+Orka targets the latest stable agent-sandbox release for testing. The Go
+dependency, local installer, and bundled E2E currently pin `v1.0.3` for
+reproducibility; this test pin is not a minimum supported version. Older releases
+are not considered unsupported solely because they predate the pin, though
+compatibility outside the tested version is not guaranteed. Any minimum-version
+requirement must identify the required API, feature, or bug fix.
+
+Operators upgrading an existing v0.5 installation to v1 must complete the
+upstream [storage migration](https://github.com/kubernetes-sigs/agent-sandbox/blob/v0.5.6/docs/api-migration-guide.md)
+before installing v1. Orka does not install, upgrade, or migrate the provider
+in production.
 
 `Task.spec.workspace` remains the only repository surface — verified source,
 workspace intent, and clean-room publication policy:
@@ -77,7 +88,7 @@ Everything the adapter cannot host is rejected before any workspace or
 RuntimePool demand exists, with the reason projected to
 `Task.status.executionWorkspace`:
 
-- unsupported providers (only `agent-sandbox` and `substrate` are implemented; see the [Substrate](substrate.md) page for the Phase 2 backend);
+- unsupported providers (only `agent-sandbox` and [`substrate`](substrate.md) are implemented);
 - `templateRef` — ACP RuntimeSessions run only controller-rendered sandbox
   templates, because the immutable runtime image, fence environment,
   materialization attestation, and signed bootstrap key must be rendered as one
@@ -112,13 +123,3 @@ provider-neutral contract, ownership state machine, and recovery semantics.
 resource requests remain unsupported by the built-in ACP path. Runtime
 isolation and resources are selected through reviewed RuntimePool profiles.
 Container and native `ai` Tasks keep their existing `spec.execution` behavior.
-
-## Local evaluation material
-
-The repository still contains local/kind evaluation scripts for the older
-worker-based execution-workspace prototype. They are not the supported ACP v2
-deployment path and should not be used as release evidence. Agent runtime
-validation should verify RuntimePool scale-up, exact-instance fencing, Session
-continuation, cancellation, workspace validation, clean-room publication,
-controller restart behavior, pool replacement, and cleanup — including the
-workspace-backed pool variants when the dispatch flag is enabled.

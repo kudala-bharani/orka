@@ -6,7 +6,7 @@ description: "OpenTelemetry traces, GenAI metrics, and how to follow one task th
 # Observability
 
 Orka emits OpenTelemetry traces and metrics for controller, chat, tool, native AI
-worker, and ACP v2 controller/supervisor paths when telemetry is enabled. ACP runtime
+worker, and Orka harness v2 controller/supervisor paths when telemetry is enabled. ACP runtime
 internals remain observable primarily through durable Task execution/delivery
 status, RuntimePool status, bounded events, and structured logs. The GenAI
 signals are backend instrumentation: they are exported over OTLP to your
@@ -14,6 +14,10 @@ collector/backend and are separate from the Orka React UI.
 
 Telemetry is disabled by default. Disabled mode keeps the hot path on the global
 OpenTelemetry no-op providers and does not configure OTLP exporters.
+
+For retained team usage and tokens per merged PR in the dashboard, see
+[Usage and PR outcomes](usage-and-pr-outcomes.md). That report records counts
+independently of telemetry and includes measurement gaps.
 
 ## Enable telemetry
 
@@ -160,7 +164,7 @@ task.run
                   └─ execute_tool {tool.name}
 ```
 
-An ACP v2 Task continues the same Task-carried trace across controller and supervisor:
+An Orka harness v2 Task continues the same Task-carried trace across controller and supervisor:
 
 ```text
 <Task-carried parent span>
@@ -179,7 +183,7 @@ model client span.
 Task creation stamps the current W3C trace context into Task annotations. The
 controller extracts that context for `task.reconcile` and controller-side ACP
 spans. Supported native worker Tasks also receive `ORKA_TRACEPARENT` in their
-Jobs. ACP v2 runtime requests carry `traceparent` and `tracestate` headers to
+Jobs. Orka harness v2 runtime requests carry `traceparent` and `tracestate` headers to
 authenticated supervisor operations; provider CLI children remain outside this
 instrumentation. Delegation stamps the active `execute_tool delegate_task` span
 context onto the child Task so child controller, supervisor and native-worker
@@ -188,6 +192,25 @@ spans remain linked.
 Outbound HTTP and MCP Tool CRD requests receive W3C `traceparent` headers. If a
 Tool config supplies its own `traceparent` header, the active Orka trace context
 wins.
+
+### Instrumented components
+
+| Tracer | Span | Attributes |
+|--------|------|------------|
+| `orka.api` | HTTP/API middleware spans | HTTP request/route/status metadata |
+| `orka.chat` | `chat.request`, `chat.tool_loop.iteration` | session metadata; `chat.iteration`, `orka.tenant`, requested model, tool-call count |
+| `orka.worker` | `task.run` | `orka.task.id`, namespace, and agent name when known |
+| `orka.acp` | `acp.prompt`, `acp.session.create`, `acp.session.continue`, `acp.publication.reconcile` | `orka.task.id`, namespace, attempt/prompt identity, RuntimePool/RuntimeSession identity, prompt/session outcome, publication identity, and agent name when known |
+| `orka.acp.supervisor` | `acp.supervisor.*` authenticated runtime operations | Task UID/attempt, prompt/operation IDs and runtime pool/session identity; no request content |
+| `orka.agent` | `agent.step` | iteration, requested model/provider, tool-call count, Orka task metadata |
+| `orka.gen_ai` | `chat {model}` | `gen_ai.*` provider/model/token metadata and `error.type` |
+| `orka.gen_ai` | `execute_tool {tool.name}` | `gen_ai.tool.*`, `orka.tool.name`, `orka.tool.kind`, `orka.tool.result.size_bytes`, parent/child task fields for delegation |
+| `orka.controller` | `task.reconcile` | task name, namespace, type, and propagated trace context |
+
+Use `orka.task.id` to find a Task trace, `orka.tool.name` to find specific tool
+executions, and `orka.parent_task.id` / `orka.child_task.id` to follow delegated
+children. Tool spans do not include raw arguments or complete result bodies, but a structured tool
+error message can appear in the span status description.
 
 ### OpenTelemetry traces vs Task trace read model
 

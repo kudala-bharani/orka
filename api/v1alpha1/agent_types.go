@@ -71,6 +71,19 @@ type AgentSpec struct {
 	TTLAfterLastTask *metav1.Duration `json:"ttlAfterLastTask,omitempty"`
 }
 
+// MarshalJSON preserves an explicitly empty native tool policy instead of
+// omitting it. Nil and nonempty lists retain their existing wire representation.
+func (in AgentSpec) MarshalJSON() ([]byte, error) {
+	type agentSpecJSON AgentSpec
+	if in.Tools == nil || len(in.Tools) > 0 {
+		return json.Marshal(agentSpecJSON(in))
+	}
+	return json.Marshal(struct {
+		agentSpecJSON
+		Tools []ToolReference `json:"tools"`
+	}{agentSpecJSON: agentSpecJSON(in), Tools: in.Tools})
+}
+
 // AgentCLIRuntime defines agent CLI runtime configuration for an Agent.
 // +kubebuilder:validation:XValidation:rule="has(self.type) != has(self.runtimeRef)",message="exactly one of type or runtimeRef is required"
 // +kubebuilder:validation:XValidation:rule="!has(oldSelf.contractVersion) || (has(self.contractVersion) && self.contractVersion == oldSelf.contractVersion)",message="runtime.contractVersion is immutable once set"
@@ -109,8 +122,8 @@ type AgentCLIRuntime struct {
 	DefaultAllowBash *bool `json:"defaultAllowBash,omitempty"`
 
 	// DefaultReasoningEffort configures the CLI runtime reasoning effort for tasks using this Agent.
-	// Runtime adapters reject values they do not support (for example, Codex does not support max).
-	// +kubebuilder:validation:Enum=low;medium;high;xhigh;max
+	// Runtime adapters reject values they do not support (none is Codex-only; max is Claude-only).
+	// +kubebuilder:validation:Enum=none;low;medium;high;xhigh;max
 	// +optional
 	DefaultReasoningEffort string `json:"defaultReasoningEffort,omitempty"`
 }
@@ -193,7 +206,8 @@ type ModelConfig struct {
 
 	// MaxTokens limits the response length. OpenCode validates positive reviewed
 	// limits at its runtime-specific admission boundary; existing Agent objects
-	// may retain the legacy zero value.
+	// may retain the legacy zero value, which selects the worker default.
+	// +kubebuilder:validation:Minimum=0
 	// +optional
 	MaxTokens *int32 `json:"maxTokens,omitempty"`
 
